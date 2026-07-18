@@ -230,12 +230,38 @@ fn str_params(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Rewrites a host-style absolute path (Windows: `C:\dev\gm/.gm/gm.db`,
+/// possibly mixed-separator) into the WASI-guest POSIX path this plugin's
+/// own `/`-rooted preopen (set up host-side by
+/// agentplug-host::HostState::new_with_fs_root, guest path "/") expects --
+/// this wasm module is built with libsql-ffi's `wasm32-wasi-vfs` feature, so
+/// sqlite3_open_v2 issues real wasi-libc path_open calls, which prefix-match
+/// the request against registered preopen guest paths and have no concept
+/// of a Windows drive letter at all. `:memory:` and already-POSIX paths
+/// (starting with `/`) pass through unchanged.
+fn to_wasi_guest_path(path: &str) -> String {
+    if path.is_empty() || path == ":memory:" || path.starts_with('/') {
+        return path.to_string();
+    }
+    let mut p = path.to_string();
+    if p.len() > 1 && p.as_bytes()[1] == b':' {
+        p = p[2..].to_string();
+    }
+    p = p.replace('\\', "/");
+    if !p.starts_with('/') {
+        p = format!("/{p}");
+    }
+    p
+}
+
 /// Every verb requires an explicit `path` (the real db file path, resolved
 /// by the CALLER against its own project root) -- there is no persistent
 /// `name` -> connection mapping anymore, so `name` alone is no longer a
 /// meaningful identifier once one plugin instance serves every project.
 pub fn handle(verb: &str, body: &Value) -> u64 {
-    let path = body.get("path").and_then(|v| v.as_str()).unwrap_or(":memory:");
+    let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or(":memory:");
+    let owned_path = to_wasi_guest_path(raw_path);
+    let path = owned_path.as_str();
     match verb {
         // "open"/"close"/"begin"/"commit"/"rollback" are no-ops now -- every
         // exec/query call is already its own open-operate-close cycle, so
