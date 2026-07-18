@@ -1,24 +1,36 @@
 use libsql_ffi as ffi;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::ptr;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
 
 use crate::abi::{ok_err, return_json};
 
-static DBS: Mutex<Option<HashMap<String, DbHandle>>> = Mutex::new(None);
+/// Every verb below opens the db fresh, does its one operation, and closes
+/// it before returning -- no connection, prepared statement, or transaction
+/// state survives past a single dispatch call. This makes the plugin safe
+/// to share as ONE process-wide instance across any number of concurrently
+/// active projects/agents (no per-project connection map to collide on),
+/// per the explicit design directive: "opening the db in the current
+/// folder under .gm, processing the instruction, and then closing it,
+/// making it stateless and safe to process any number of agents at the
+/// same time, in any folder, at the same time." The real cost is fresh
+/// sqlite3_open_v2/close on every call instead of an amortized-once
+/// connection -- accepted deliberately in exchange for zero shared-state
+/// correctness risk.
+struct RawDb(*mut ffi::sqlite3);
+unsafe impl Send for RawDb {}
 
-struct DbHandle(*mut ffi::sqlite3);
-unsafe impl Send for DbHandle {}
-
-fn open(name: &str, path: &str) -> Result<(), String> {
-    let mut guard = DBS.lock().map_err(|e| e.to_string())?;
-    let map = guard.get_or_insert_with(HashMap::new);
-    if map.contains_key(name) {
-        return Ok(());
+impl Drop for RawDb {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                ffi::sqlite3_close(self.0);
+            }
+        }
     }
+}
+
+fn open_db(path: &str) -> Result<RawDb, String> {
     let cpath = CString::new(path).map_err(|e| e.to_string())?;
     let mut db: *mut ffi::sqlite3 = ptr::null_mut();
     let rc = unsafe { ffi::sqlite3_open_v2(cpath.as_ptr(), &mut db, ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE, ptr::null()) };
@@ -34,58 +46,27 @@ fn open(name: &str, path: &str) -> Result<(), String> {
         };
         return Err(format!("sqlite3_open_v2 {msg}"));
     }
-    map.insert(name.to_string(), DbHandle(db));
-    Ok(())
+    Ok(RawDb(db))
 }
 
-fn close(name: &str) -> Result<(), String> {
-    let mut guard = DBS.lock().map_err(|e| e.to_string())?;
-    let map = match guard.as_mut() {
-        Some(m) => m,
-        None => return Ok(()),
-    };
-    if let Some(h) = map.remove(name) {
-        unsafe {
-            ffi::sqlite3_close(h.0);
-        }
+fn exec(path: &str, sql: &str) -> Result<(), String> {
+    let db = open_db(path)?;
+    let csql = CString::new(sql).map_err(|e| e.to_string())?;
+    let mut err_ptr: *mut i8 = ptr::null_mut();
+    let rc = unsafe { ffi::sqlite3_exec(db.0, csql.as_ptr(), None, ptr::null_mut(), &mut err_ptr) };
+    if rc != ffi::SQLITE_OK {
+        let msg = if err_ptr.is_null() {
+            "unknown".to_string()
+        } else {
+            let s = unsafe { CStr::from_ptr(err_ptr).to_string_lossy().into_owned() };
+            unsafe {
+                ffi::sqlite3_free(err_ptr as *mut _);
+            }
+            s
+        };
+        return Err(format!("exec rc={rc} msg={msg}"));
     }
     Ok(())
-}
-
-fn list_dbs() -> Vec<String> {
-    let guard = DBS.lock().ok();
-    guard.as_ref().and_then(|g| g.as_ref()).map(|m| m.keys().cloned().collect()).unwrap_or_default()
-}
-
-fn with_db<F, R>(name: &str, f: F) -> Result<R, String>
-where
-    F: FnOnce(*mut ffi::sqlite3) -> Result<R, String>,
-{
-    let guard = DBS.lock().map_err(|e| e.to_string())?;
-    let map = guard.as_ref().ok_or_else(|| "no dbs open".to_string())?;
-    let h = map.get(name).ok_or_else(|| format!("db '{name}' not open"))?;
-    f(h.0)
-}
-
-fn exec(name: &str, sql: &str) -> Result<(), String> {
-    with_db(name, |db| {
-        let csql = CString::new(sql).map_err(|e| e.to_string())?;
-        let mut err_ptr: *mut i8 = ptr::null_mut();
-        let rc = unsafe { ffi::sqlite3_exec(db, csql.as_ptr(), None, ptr::null_mut(), &mut err_ptr) };
-        if rc != ffi::SQLITE_OK {
-            let msg = if err_ptr.is_null() {
-                "unknown".to_string()
-            } else {
-                let s = unsafe { CStr::from_ptr(err_ptr).to_string_lossy().into_owned() };
-                unsafe {
-                    ffi::sqlite3_free(err_ptr as *mut _);
-                }
-                s
-            };
-            return Err(format!("exec rc={rc} msg={msg}"));
-        }
-        Ok(())
-    })
 }
 
 fn column_value(stmt: *mut ffi::sqlite3_stmt, i: i32) -> Value {
@@ -163,141 +144,71 @@ fn query_impl(db: *mut ffi::sqlite3, sql: &str, params: &[&str]) -> Result<Value
     Ok(Value::Array(rows))
 }
 
-fn exec_params(name: &str, sql: &str, params: &[&str]) -> Result<(), String> {
-    with_db(name, |db| {
-        let csql = CString::new(sql).map_err(|e| e.to_string())?;
-        let cparams: Vec<CString> = params.iter().map(|p| CString::new(*p).map_err(|e| e.to_string())).collect::<Result<Vec<_>, _>>()?;
-        let mut stmt: *mut ffi::sqlite3_stmt = ptr::null_mut();
-        let rc = unsafe { ffi::sqlite3_prepare_v2(db, csql.as_ptr(), -1, &mut stmt, ptr::null_mut()) };
-        if rc != ffi::SQLITE_OK {
-            let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(db)).to_string_lossy().into_owned() };
-            return Err(format!("prepare rc={rc} msg={msg}"));
-        }
-        for (i, cp) in cparams.iter().enumerate() {
-            let rc = unsafe { ffi::sqlite3_bind_text(stmt, (i + 1) as i32, cp.as_ptr(), -1, None) };
-            if rc != ffi::SQLITE_OK {
-                unsafe {
-                    ffi::sqlite3_finalize(stmt);
-                }
-                return Err(format!("bind param {i} rc={rc}"));
-            }
-        }
-        let step = unsafe { ffi::sqlite3_step(stmt) };
-        unsafe {
-            ffi::sqlite3_finalize(stmt);
-        }
-        if step != ffi::SQLITE_DONE && step != ffi::SQLITE_ROW {
-            let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(db)).to_string_lossy().into_owned() };
-            return Err(format!("step rc={step} msg={msg}"));
-        }
-        Ok(())
-    })
+fn query(path: &str, sql: &str, params: &[&str]) -> Result<Value, String> {
+    let db = open_db(path)?;
+    query_impl(db.0, sql, params)
 }
 
-fn serialize(name: &str) -> Result<Vec<u8>, String> {
-    with_db(name, |db| {
-        let schema = CString::new("main").unwrap();
-        let mut size: i64 = 0;
-        let p = unsafe { ffi::sqlite3_serialize(db, schema.as_ptr(), &mut size, 0) };
-        if p.is_null() || size <= 0 {
-            return Err(format!("serialize null (size={size})"));
-        }
-        let bytes = unsafe { std::slice::from_raw_parts(p, size as usize).to_vec() };
-        unsafe {
-            ffi::sqlite3_free(p as *mut _);
-        }
-        Ok(bytes)
-    })
-}
-
-fn deserialize(name: &str, bytes: &[u8]) -> Result<(), String> {
-    with_db(name, |db| {
-        let schema = CString::new("main").unwrap();
-        let size = bytes.len() as i64;
-        let buf = unsafe { ffi::sqlite3_malloc64(size as u64) } as *mut u8;
-        if buf.is_null() {
-            return Err("malloc failed".to_string());
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
-        }
-        let flags = (ffi::SQLITE_DESERIALIZE_FREEONCLOSE | ffi::SQLITE_DESERIALIZE_RESIZEABLE) as u32;
-        let rc = unsafe { ffi::sqlite3_deserialize(db, schema.as_ptr(), buf, size, size, flags) };
-        if rc != ffi::SQLITE_OK {
-            return Err(format!("deserialize rc={rc}"));
-        }
-        Ok(())
-    })
-}
-
-// Prepared statements can't cross the plugin ABI boundary as raw pointers --
-// the caller (gm.wasm) only ever sees an opaque u32 handle id, resolved back
-// to the real *mut sqlite3_stmt on THIS side for every execute_bound call.
-// This is the one real shape change from rs-plugkit's libsql_wasm.rs (which
-// returned an owned PreparedStmt struct directly, valid only within a single
-// wasm module's own address space).
-struct PreparedEntry {
-    db: *mut ffi::sqlite3,
-    stmt: *mut ffi::sqlite3_stmt,
-}
-unsafe impl Send for PreparedEntry {}
-
-impl Drop for PreparedEntry {
-    fn drop(&mut self) {
-        if !self.stmt.is_null() {
-            unsafe {
-                ffi::sqlite3_finalize(self.stmt);
-            }
-        }
-    }
-}
-
-static PREPARED: Mutex<Option<HashMap<u32, PreparedEntry>>> = Mutex::new(None);
-static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
-
-fn prepare_stmt(name: &str, sql: &str) -> Result<u32, String> {
-    with_db(name, |db| {
-        let csql = CString::new(sql).map_err(|e| e.to_string())?;
-        let mut stmt: *mut ffi::sqlite3_stmt = ptr::null_mut();
-        let rc = unsafe { ffi::sqlite3_prepare_v2(db, csql.as_ptr(), -1, &mut stmt, ptr::null_mut()) };
-        if rc != ffi::SQLITE_OK {
-            let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(db)).to_string_lossy().into_owned() };
-            return Err(format!("prepare rc={rc} msg={msg}"));
-        }
-        let handle = NEXT_HANDLE.fetch_add(1, Ordering::SeqCst);
-        let mut guard = PREPARED.lock().map_err(|e| e.to_string())?;
-        guard.get_or_insert_with(HashMap::new).insert(handle, PreparedEntry { db, stmt });
-        Ok(handle)
-    })
-}
-
-fn execute_bound(handle: u32, params: &[&str]) -> Result<(), String> {
-    let guard = PREPARED.lock().map_err(|e| e.to_string())?;
-    let map = guard.as_ref().ok_or_else(|| "no prepared statements".to_string())?;
-    let entry = map.get(&handle).ok_or_else(|| format!("unknown prepared statement handle {handle}"))?;
+fn exec_params(path: &str, sql: &str, params: &[&str]) -> Result<(), String> {
+    let db = open_db(path)?;
+    let csql = CString::new(sql).map_err(|e| e.to_string())?;
     let cparams: Vec<CString> = params.iter().map(|p| CString::new(*p).map_err(|e| e.to_string())).collect::<Result<Vec<_>, _>>()?;
-    unsafe {
-        ffi::sqlite3_reset(entry.stmt);
-        ffi::sqlite3_clear_bindings(entry.stmt);
+    let mut stmt: *mut ffi::sqlite3_stmt = ptr::null_mut();
+    let rc = unsafe { ffi::sqlite3_prepare_v2(db.0, csql.as_ptr(), -1, &mut stmt, ptr::null_mut()) };
+    if rc != ffi::SQLITE_OK {
+        let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(db.0)).to_string_lossy().into_owned() };
+        return Err(format!("prepare rc={rc} msg={msg}"));
     }
     for (i, cp) in cparams.iter().enumerate() {
-        let rc = unsafe { ffi::sqlite3_bind_text(entry.stmt, (i + 1) as i32, cp.as_ptr(), -1, None) };
+        let rc = unsafe { ffi::sqlite3_bind_text(stmt, (i + 1) as i32, cp.as_ptr(), -1, None) };
         if rc != ffi::SQLITE_OK {
+            unsafe {
+                ffi::sqlite3_finalize(stmt);
+            }
             return Err(format!("bind param {i} rc={rc}"));
         }
     }
-    let step = unsafe { ffi::sqlite3_step(entry.stmt) };
+    let step = unsafe { ffi::sqlite3_step(stmt) };
+    unsafe {
+        ffi::sqlite3_finalize(stmt);
+    }
     if step != ffi::SQLITE_DONE && step != ffi::SQLITE_ROW {
-        let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(entry.db)).to_string_lossy().into_owned() };
+        let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(db.0)).to_string_lossy().into_owned() };
         return Err(format!("step rc={step} msg={msg}"));
     }
     Ok(())
 }
 
-fn finalize_stmt(handle: u32) -> Result<(), String> {
-    let mut guard = PREPARED.lock().map_err(|e| e.to_string())?;
-    if let Some(map) = guard.as_mut() {
-        map.remove(&handle);
+fn serialize(path: &str) -> Result<Vec<u8>, String> {
+    let db = open_db(path)?;
+    let schema = CString::new("main").unwrap();
+    let mut size: i64 = 0;
+    let p = unsafe { ffi::sqlite3_serialize(db.0, schema.as_ptr(), &mut size, 0) };
+    if p.is_null() || size <= 0 {
+        return Err(format!("serialize null (size={size})"));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(p, size as usize).to_vec() };
+    unsafe {
+        ffi::sqlite3_free(p as *mut _);
+    }
+    Ok(bytes)
+}
+
+fn deserialize(path: &str, bytes: &[u8]) -> Result<(), String> {
+    let db = open_db(path)?;
+    let schema = CString::new("main").unwrap();
+    let size = bytes.len() as i64;
+    let buf = unsafe { ffi::sqlite3_malloc64(size as u64) } as *mut u8;
+    if buf.is_null() {
+        return Err("malloc failed".to_string());
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+    }
+    let flags = (ffi::SQLITE_DESERIALIZE_FREEONCLOSE | ffi::SQLITE_DESERIALIZE_RESIZEABLE) as u32;
+    let rc = unsafe { ffi::sqlite3_deserialize(db.0, schema.as_ptr(), buf, size, size, flags) };
+    if rc != ffi::SQLITE_OK {
+        return Err(format!("deserialize rc={rc}"));
     }
     Ok(())
 }
@@ -319,41 +230,29 @@ fn str_params(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The prepare/execute_bound/finalize handle round-trips through JSON as
-/// either a bare number or a numeric string -- plugkit-core's migrated
-/// libsql_wasm.rs treats prepare's returned "handle" as an opaque string
-/// (`.as_str()`), since a cross-process statement handle is conceptually an
-/// opaque token, not an integer the caller should do arithmetic on. Accept
-/// both encodings here so either calling convention resolves correctly.
-fn read_handle(body: &Value) -> u32 {
-    if let Some(n) = body.get("handle").and_then(|v| v.as_u64()) {
-        return n as u32;
-    }
-    body.get("handle").and_then(|v| v.as_str()).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0)
-}
-
+/// Every verb requires an explicit `path` (the real db file path, resolved
+/// by the CALLER against its own project root) -- there is no persistent
+/// `name` -> connection mapping anymore, so `name` alone is no longer a
+/// meaningful identifier once one plugin instance serves every project.
 pub fn handle(verb: &str, body: &Value) -> u64 {
-    let name = body.get("db").and_then(|v| v.as_str()).unwrap_or("default");
+    let path = body.get("path").and_then(|v| v.as_str()).unwrap_or(":memory:");
     match verb {
-        "open" => {
-            let path = body.get("path").and_then(|v| v.as_str()).unwrap_or(":memory:");
-            ok_err(open(name, path))
-        }
-        "close" => ok_err(close(name)),
-        "list_dbs" => return_json(json!({"ok": true, "dbs": list_dbs()})),
+        // "open"/"close"/"begin"/"commit"/"rollback" are no-ops now -- every
+        // exec/query call is already its own open-operate-close cycle, so
+        // there is nothing left to open/close/transact ahead of time. Kept
+        // as accepted-but-inert verbs rather than "unknown_verb" errors so
+        // existing callers that still send them don't need updating first.
+        "open" | "close" | "begin" | "commit" | "rollback" => ok_err(Ok(())),
+        "list_dbs" => return_json(json!({"ok": true, "dbs": Vec::<String>::new()})),
         "exec" => {
             let sql = body.get("sql").and_then(|v| v.as_str()).unwrap_or("");
-            ok_err(exec(name, sql))
+            ok_err(exec(path, sql))
         }
-        // "query" (no params expected, but params are read anyway if
-        // present) and "query_params" (plugkit-core's distinct verb name
-        // for the parameterized case) are the same operation on this side
-        // -- str_params already defaults to an empty Vec when absent.
         "query" | "query_params" => {
             let sql = body.get("sql").and_then(|v| v.as_str()).unwrap_or("");
             let params = str_params(body);
             let refs: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
-            match query_impl_named(name, sql, &refs) {
+            match query(path, sql, &refs) {
                 Ok(rows) => return_json(json!({"ok": true, "rows": rows})),
                 Err(e) => return_json(json!({"ok": false, "error": e})),
             }
@@ -362,35 +261,25 @@ pub fn handle(verb: &str, body: &Value) -> u64 {
             let sql = body.get("sql").and_then(|v| v.as_str()).unwrap_or("");
             let params = str_params(body);
             let refs: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
-            ok_err(exec_params(name, sql, &refs))
+            ok_err(exec_params(path, sql, &refs))
         }
-        "begin" => ok_err(exec(name, "BEGIN IMMEDIATE")),
-        "commit" => ok_err(exec(name, "COMMIT")),
-        "rollback" => ok_err(exec(name, "ROLLBACK")),
-        "prepare" => {
+        // "prepare"/"execute_bound"/"finalize" (a cross-call prepared
+        // statement handle) is inherently incompatible with per-call
+        // statelessness -- collapsed into a single atomic verb that
+        // prepares, binds, steps, and finalizes within one open-operate-close
+        // cycle, same shape as exec_params. Callers doing a prepare-once/
+        // execute-many bulk-insert loop now pay one open+prepare+bind+step
+        // per row instead of amortizing prepare across the loop -- a real,
+        // deliberate cost accepted in exchange for zero persistent state.
+        "prepare_execute" | "execute_bound" => {
             let sql = body.get("sql").and_then(|v| v.as_str()).unwrap_or("");
-            match prepare_stmt(name, sql) {
-                // Returned as a string -- plugkit-core's caller treats a
-                // prepared-statement handle as an opaque token (.as_str()),
-                // not an integer to do arithmetic on.
-                Ok(h) => return_json(json!({"ok": true, "handle": h.to_string()})),
-                Err(e) => return_json(json!({"ok": false, "error": e})),
-            }
-        }
-        "execute_bound" => {
-            let h = read_handle(body);
             let params = str_params(body);
             let refs: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
-            ok_err(execute_bound(h, &refs))
+            ok_err(exec_params(path, sql, &refs))
         }
-        "finalize" => {
-            let h = read_handle(body);
-            ok_err(finalize_stmt(h))
-        }
-        // "data" is the caller's field name (plugkit-core's migrated
-        // libsql_wasm.rs); "bytes_b64" is this plugin's original name --
-        // accept/emit both so either calling convention round-trips.
-        "serialize" => match serialize(name) {
+        "prepare" => return_json(json!({"ok": false, "error": "prepare/finalize handles removed -- use prepare_execute (or exec_params) which does prepare+bind+step+finalize atomically per call"})),
+        "finalize" => ok_err(Ok(())),
+        "serialize" => match serialize(path) {
             Ok(bytes) => {
                 let b64 = base64_encode(&bytes);
                 return_json(json!({"ok": true, "data": b64.clone(), "bytes_b64": b64}))
@@ -404,17 +293,13 @@ pub fn handle(verb: &str, body: &Value) -> u64 {
                 .or_else(|| body.get("bytes_b64").and_then(|v| v.as_str()))
                 .unwrap_or("");
             match base64_decode(b64) {
-                Ok(bytes) => ok_err(deserialize(name, &bytes)),
+                Ok(bytes) => ok_err(deserialize(path, &bytes)),
                 Err(e) => return_json(json!({"ok": false, "error": e})),
             }
         }
         "version" => return_json(json!({"ok": true, "version": libsql_version()})),
         _ => return_json(json!({"ok": false, "error": "unknown_verb", "verb": verb})),
     }
-}
-
-fn query_impl_named(name: &str, sql: &str, params: &[&str]) -> Result<Value, String> {
-    with_db(name, |db| query_impl(db, sql, params))
 }
 
 // Minimal base64 (no external dependency) for serialize/deserialize's byte
