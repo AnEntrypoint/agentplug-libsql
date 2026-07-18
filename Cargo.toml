@@ -1,0 +1,24 @@
+[package]
+name = "agentplug-libsql"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "agentplug_libsql"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "z"
+
+[dependencies]
+serde_json = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Same exact pin as rs-plugkit's plugkit-core -- see that Cargo.toml's own
+# comment for the full 0.9.0-0.9.30 range research (nothing wasm32/WASI-
+# specific changed across it; kept as an exact pin as defensive posture).
+libsql-ffi = { version = "=0.9.30", default-features = false, features = ["wasm32-wasi-vfs"] }
