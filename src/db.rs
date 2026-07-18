@@ -314,6 +314,19 @@ fn str_params(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The prepare/execute_bound/finalize handle round-trips through JSON as
+/// either a bare number or a numeric string -- plugkit-core's migrated
+/// libsql_wasm.rs treats prepare's returned "handle" as an opaque string
+/// (`.as_str()`), since a cross-process statement handle is conceptually an
+/// opaque token, not an integer the caller should do arithmetic on. Accept
+/// both encodings here so either calling convention resolves correctly.
+fn read_handle(body: &Value) -> u32 {
+    if let Some(n) = body.get("handle").and_then(|v| v.as_u64()) {
+        return n as u32;
+    }
+    body.get("handle").and_then(|v| v.as_str()).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0)
+}
+
 pub fn handle(verb: &str, body: &Value) -> u64 {
     let name = body.get("db").and_then(|v| v.as_str()).unwrap_or("default");
     match verb {
@@ -326,7 +339,11 @@ pub fn handle(verb: &str, body: &Value) -> u64 {
             let sql = body.get("sql").and_then(|v| v.as_str()).unwrap_or("");
             ok_err(exec(name, sql))
         }
-        "query" => {
+        // "query" (no params expected, but params are read anyway if
+        // present) and "query_params" (plugkit-core's distinct verb name
+        // for the parameterized case) are the same operation on this side
+        // -- str_params already defaults to an empty Vec when absent.
+        "query" | "query_params" => {
             let sql = body.get("sql").and_then(|v| v.as_str()).unwrap_or("");
             let params = str_params(body);
             let refs: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
@@ -347,26 +364,39 @@ pub fn handle(verb: &str, body: &Value) -> u64 {
         "prepare" => {
             let sql = body.get("sql").and_then(|v| v.as_str()).unwrap_or("");
             match prepare_stmt(name, sql) {
-                Ok(h) => return_json(json!({"ok": true, "handle": h})),
+                // Returned as a string -- plugkit-core's caller treats a
+                // prepared-statement handle as an opaque token (.as_str()),
+                // not an integer to do arithmetic on.
+                Ok(h) => return_json(json!({"ok": true, "handle": h.to_string()})),
                 Err(e) => return_json(json!({"ok": false, "error": e})),
             }
         }
         "execute_bound" => {
-            let h = body.get("handle").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let h = read_handle(body);
             let params = str_params(body);
             let refs: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
             ok_err(execute_bound(h, &refs))
         }
         "finalize" => {
-            let h = body.get("handle").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let h = read_handle(body);
             ok_err(finalize_stmt(h))
         }
+        // "data" is the caller's field name (plugkit-core's migrated
+        // libsql_wasm.rs); "bytes_b64" is this plugin's original name --
+        // accept/emit both so either calling convention round-trips.
         "serialize" => match serialize(name) {
-            Ok(bytes) => return_json(json!({"ok": true, "bytes_b64": base64_encode(&bytes)})),
+            Ok(bytes) => {
+                let b64 = base64_encode(&bytes);
+                return_json(json!({"ok": true, "data": b64.clone(), "bytes_b64": b64}))
+            }
             Err(e) => return_json(json!({"ok": false, "error": e})),
         },
         "deserialize" => {
-            let b64 = body.get("bytes_b64").and_then(|v| v.as_str()).unwrap_or("");
+            let b64 = body
+                .get("data")
+                .and_then(|v| v.as_str())
+                .or_else(|| body.get("bytes_b64").and_then(|v| v.as_str()))
+                .unwrap_or("");
             match base64_decode(b64) {
                 Ok(bytes) => ok_err(deserialize(name, &bytes)),
                 Err(e) => return_json(json!({"ok": false, "error": e})),
