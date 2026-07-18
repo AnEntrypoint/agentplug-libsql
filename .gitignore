@@ -1,2 +1,10 @@
 /target
 Cargo.lock
+
+# >>> plugkit managed
+.gm/exec-spool/
+.gm/last-dispatch-ts
+.gm/last-instruction-ts
+.gm/long-gap-retry-state
+.gm/witness/
+# <<< plugkit managed
