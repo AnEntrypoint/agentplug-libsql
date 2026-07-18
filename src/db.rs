@@ -52,6 +52,11 @@ fn close(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn list_dbs() -> Vec<String> {
+    let guard = DBS.lock().ok();
+    guard.as_ref().and_then(|g| g.as_ref()).map(|m| m.keys().cloned().collect()).unwrap_or_default()
+}
+
 fn with_db<F, R>(name: &str, f: F) -> Result<R, String>
 where
     F: FnOnce(*mut ffi::sqlite3) -> Result<R, String>,
@@ -335,6 +340,7 @@ pub fn handle(verb: &str, body: &Value) -> u64 {
             ok_err(open(name, path))
         }
         "close" => ok_err(close(name)),
+        "list_dbs" => return_json(json!({"ok": true, "dbs": list_dbs()})),
         "exec" => {
             let sql = body.get("sql").and_then(|v| v.as_str()).unwrap_or("");
             ok_err(exec(name, sql))
