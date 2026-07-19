@@ -46,6 +46,15 @@ fn open_db(path: &str) -> Result<RawDb, String> {
         };
         return Err(format!("sqlite3_open_v2 {msg}"));
     }
+    // Without a busy handler sqlite returns SQLITE_BUSY(5) the instant it finds
+    // the db locked rather than waiting for the holder to finish. This plugin
+    // is stateless by design -- every exec/query opens and closes the file
+    // again -- so concurrent dispatches genuinely contend, and the symptom was
+    // a live `exec rc=5 msg=database is locked` that silently degraded recall's
+    // vector half to an empty kv_query fallback. Wait for the lock instead.
+    unsafe {
+        ffi::sqlite3_busy_timeout(db, 5000);
+    }
     Ok(RawDb(db))
 }
 
