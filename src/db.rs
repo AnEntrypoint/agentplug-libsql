@@ -23,8 +23,24 @@ unsafe impl Send for RawDb {}
 impl Drop for RawDb {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // sqlite3_close (strict) returns SQLITE_BUSY and leaves the
+            // connection ALIVE if any prepared statement/blob handle on it
+            // hasn't been finalized -- and its return value was previously
+            // discarded here, so a failed close silently orphaned a live
+            // connection that still holds SQLite's own internal lock on the
+            // db file for the rest of the process's life. Every later
+            // open_db() on the same path then races that orphan and gets
+            // `database is locked`, with no OS-level file lock and no
+            // second process visible to explain it (the exact symptom
+            // reproduced live: sqlite3 CLI opens the file fine from
+            // outside, yet every in-process call after the first still
+            // sees rc=5). sqlite3_close_v2 never fails this way -- it always
+            // detaches the connection immediately and, if statements are
+            // still pending, defers the actual deallocation until they
+            // finish on their own, so Drop can never leave a phantom
+            // lock-holder behind.
             unsafe {
-                ffi::sqlite3_close(self.0);
+                ffi::sqlite3_close_v2(self.0);
             }
         }
     }
