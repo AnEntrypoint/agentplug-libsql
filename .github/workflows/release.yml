@@ -14,56 +14,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-wasip1
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install WASI SDK (needed by libsql-ffi's bundled sqlite3.c)
-        run: |
-          curl -L -o wasi-sdk.tar.gz https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-x86_64-linux.tar.gz
-          tar xzf wasi-sdk.tar.gz
-          echo "WASI_SDK_PATH=$PWD/wasi-sdk-24.0-x86_64-linux" >> "$GITHUB_ENV"
-
-      - name: Build
-        # See BUILD.md for why every one of these defines is required --
-        # sqlite3.c's mmap/shm code paths reference POSIX symbols WASI's
-        # libc doesn't provide even with wasm32-wasi-vfs selecting the
-        # WASI-safe VFS at the Rust level; the C compile itself needs mmap
-        # shimmed-then-disabled via these exact flags (values match
-        # rs-plugkit's own working CI, ported verbatim).
-        run: |
-          export CC_wasm32_wasip1="$WASI_SDK_PATH/bin/clang"
-          export CFLAGS_wasm32_wasip1="--sysroot=$WASI_SDK_PATH/share/wasi-sysroot -DLONGDOUBLE_TYPE=double -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_DEFAULT_MMAP_SIZE=0 -DSQLITE_THREADSAFE=0 -DSQLITE_TEMP_STORE=3 -DHAVE_FDATASYNC=0 -DHAVE_POSIX_FALLOCATE=0 -DHAVE_PREAD=0 -DHAVE_PWRITE=0 -DPROT_READ=1 -DPROT_WRITE=2 -DMAP_SHARED=1 -DMAP_FAILED=((void*)-1) -DMAP_PRIVATE=2 -Wno-error=implicit-function-declaration -Wno-error=int-conversion"
-          cargo build --release --target wasm32-wasip1
-
-      - name: Read version
-        id: ver
-        run: echo "version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *\"//;s/\"//')" >> "$GITHUB_OUTPUT"
-
-      - name: Stage release assets with checksum
-        run: |
-          mkdir -p release-assets
-          cp target/wasm32-wasip1/release/agentplug_libsql.wasm release-assets/libsql.wasm
-          sha256sum release-assets/libsql.wasm | sed 's/ \*/  /' > release-assets/libsql.wasm.sha256
-
-      - name: Publish to agentplug-libsql-bin Release
-        env:
-          GH_TOKEN: ${{ secrets.PUBLISHER_TOKEN }}
-          VER: ${{ steps.ver.outputs.version }}
-        run: |
-          set -e
-          if ! gh release view "v$VER" --repo AnEntrypoint/agentplug-libsql-bin >/dev/null 2>&1; then
-            gh release create "v$VER" \
-              --repo AnEntrypoint/agentplug-libsql-bin \
-              --title "agentplug-libsql v$VER" \
-              --notes "libsql/sqlite-with-vector-search agentplug plugin, auto-published at $GITHUB_SHA"
-          fi
-          gh release upload "v$VER" --repo AnEntrypoint/agentplug-libsql-bin --clobber release-assets/*
+  release:
+    uses: AnEntrypoint/rs-plugkit/.github/workflows/wasm-plugin-release.yml@main
+    with:
+      wasm_artifact_name: agentplug_libsql.wasm
+      published_asset_basename: libsql
+      release_repo: AnEntrypoint/agentplug-libsql-bin
+      release_title_prefix: agentplug-libsql
+      pre_build_steps: |
+        curl -L -o wasi-sdk.tar.gz https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-x86_64-linux.tar.gz
+        tar xzf wasi-sdk.tar.gz
+        echo "WASI_SDK_PATH=$PWD/wasi-sdk-24.0-x86_64-linux" >> "$GITHUB_ENV"
+      build_env: |
+        export CC_wasm32_wasip1="$WASI_SDK_PATH/bin/clang"
+        export CFLAGS_wasm32_wasip1="--sysroot=$WASI_SDK_PATH/share/wasi-sysroot -DLONGDOUBLE_TYPE=double -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_DEFAULT_MMAP_SIZE=0 -DSQLITE_THREADSAFE=0 -DSQLITE_TEMP_STORE=3 -DHAVE_FDATASYNC=0 -DHAVE_POSIX_FALLOCATE=0 -DHAVE_PREAD=0 -DHAVE_PWRITE=0 -DPROT_READ=1 -DPROT_WRITE=2 -DMAP_SHARED=1 -DMAP_FAILED=((void*)-1) -DMAP_PRIVATE=2 -Wno-error=implicit-function-declaration -Wno-error=int-conversion
+      build_command: cargo build --release --target wasm32-wasip1
+    secrets:
+      publisher_token: ${{ secrets.PUBLISHER_TOKEN }}
