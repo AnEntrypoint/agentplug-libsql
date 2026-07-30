@@ -1,7 +1,9 @@
 use libsql_ffi as ffi;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::ptr;
+use std::sync::Mutex;
 
 use crate::abi::{ok_err, return_json};
 
@@ -16,7 +18,9 @@ use crate::abi::{ok_err, return_json};
 /// same time, in any folder, at the same time." The real cost is fresh
 /// sqlite3_open_v2/close on every call instead of an amortized-once
 /// connection -- accepted deliberately in exchange for zero shared-state
-/// correctness risk.
+/// correctness risk. This is the ONLY model for a real file `path` (the
+/// file itself IS the durable identity across calls -- see MEMORY_REGISTRY's
+/// doc comment for why `:memory:` needs a genuinely different mechanism).
 struct RawDb(*mut ffi::sqlite3);
 unsafe impl Send for RawDb {}
 
@@ -46,10 +50,60 @@ impl Drop for RawDb {
     }
 }
 
-fn open_db(path: &str) -> Result<RawDb, String> {
+/// EXCEPTION to RawDb's stateless-per-call contract, added after it was
+/// found live-broken (2026-07-30, thebird project). `path == ":memory:"` is
+/// the ONLY option available to a host with no real filesystem (a browser --
+/// WASI preopens require an actual backing store, which a browser genuinely
+/// does not have). Two approaches were tried and only one actually works:
+///
+/// 1. (TRIED, DOES NOT WORK) SQLite's own named shared-cache in-memory URI
+///    (`file:<name>?mode=memory&cache=shared` + `sqlite3_enable_shared_cache`)
+///    -- this ONLY keeps a shared in-memory db alive while at least one
+///    connection to it is open SIMULTANEOUSLY; the moment the LAST connection
+///    closes, SQLite destroys it, identically to bare `:memory:`. Verified
+///    live via an isolated repro (open->exec->close, then a SEPARATE
+///    open->query): the table was gone. Sequential open-operate-close, which
+///    is this whole module's contract, means there is NEVER a second
+///    simultaneous connection, so shared-cache mode buys nothing here.
+///
+/// 2. (THIS FIX) A real, explicit, process-wide connection registry, keyed
+///    by `db_name`, that keeps the actual `sqlite3*` handle open across
+///    calls for `:memory:`+named databases ONLY. This is a genuine, narrow
+///    exception to the stateless-per-call design -- the file-path case
+///    (native hosts, the original multi-agent/multi-project safety
+///    argument) is completely unaffected, since it never touches this
+///    registry. A `:memory:` connection is registered on first use under its
+///    `db_name` and reused by every later call with that same name; nothing
+///    ever evicts it automatically (a browser page's lifetime bounds it
+///    naturally -- the whole wasm instance, and this static with it, is
+///    torn down on reload/navigation, which is the correct "session ended"
+///    signal). `db_name` collisions across genuinely unrelated logical
+///    databases are the CALLER's responsibility to avoid (thebird's
+///    sqlite-shim.js already derives distinct names per app-chosen
+///    filename); this registry does not (and structurally cannot) enforce
+///    isolation beyond honoring whatever name it's given.
+static MEMORY_REGISTRY: Mutex<Option<HashMap<String, RawDb>>> = Mutex::new(None);
+
+fn with_memory_db<T>(name: &str, f: impl FnOnce(*mut ffi::sqlite3) -> Result<T, String>) -> Result<T, String> {
+    let mut guard = MEMORY_REGISTRY.lock().map_err(|e| format!("memory registry poisoned: {e}"))?;
+    let map = guard.get_or_insert_with(HashMap::new);
+    if !map.contains_key(name) {
+        let db = open_fresh(":memory:", 0)?;
+        map.insert(name.to_string(), db);
+    }
+    // Safe to unwrap: just inserted if absent.
+    let handle = map.get(name).unwrap().0;
+    f(handle)
+}
+
+/// Opens a genuinely fresh connection with no registry involvement -- the
+/// original stateless behavior, used for every file path AND for an
+/// anonymous (no `db_name`) `:memory:` request that deliberately wants a
+/// scratch db with no cross-call visibility.
+fn open_fresh(path: &str, extra_flags: i32) -> Result<RawDb, String> {
     let cpath = CString::new(path).map_err(|e| e.to_string())?;
     let mut db: *mut ffi::sqlite3 = ptr::null_mut();
-    let rc = unsafe { ffi::sqlite3_open_v2(cpath.as_ptr(), &mut db, ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE, ptr::null()) };
+    let rc = unsafe { ffi::sqlite3_open_v2(cpath.as_ptr(), &mut db, ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE | extra_flags, ptr::null()) };
     if rc != ffi::SQLITE_OK {
         let msg = if db.is_null() {
             format!("rc={rc}")
@@ -60,7 +114,7 @@ fn open_db(path: &str) -> Result<RawDb, String> {
             }
             format!("rc={rc} msg={m}")
         };
-        return Err(format!("sqlite3_open_v2 {msg}"));
+        return Err(format!("sqlite3_open_v2 {path} {msg}"));
     }
     // Without a busy handler sqlite returns SQLITE_BUSY(5) the instant it finds
     // the db locked rather than waiting for the holder to finish. This plugin
@@ -74,24 +128,40 @@ fn open_db(path: &str) -> Result<RawDb, String> {
     Ok(RawDb(db))
 }
 
-fn exec(path: &str, sql: &str) -> Result<(), String> {
-    let db = open_db(path)?;
-    let csql = CString::new(sql).map_err(|e| e.to_string())?;
-    let mut err_ptr: *mut i8 = ptr::null_mut();
-    let rc = unsafe { ffi::sqlite3_exec(db.0, csql.as_ptr(), None, ptr::null_mut(), &mut err_ptr) };
-    if rc != ffi::SQLITE_OK {
-        let msg = if err_ptr.is_null() {
-            "unknown".to_string()
-        } else {
-            let s = unsafe { CStr::from_ptr(err_ptr).to_string_lossy().into_owned() };
-            unsafe {
-                ffi::sqlite3_free(err_ptr as *mut _);
-            }
-            s
-        };
-        return Err(format!("exec rc={rc} msg={msg}"));
+/// Dispatches to either the persistent MEMORY_REGISTRY (when `path` is
+/// `:memory:` AND a `db_name` is given) or a genuinely fresh, scoped-to-this-
+/// call connection (every other case) -- the single decision point every SQL
+/// operation below routes through, so the registry-vs-fresh choice lives in
+/// exactly one place.
+fn with_db<T>(path: &str, db_name: Option<&str>, f: impl FnOnce(*mut ffi::sqlite3) -> Result<T, String>) -> Result<T, String> {
+    match db_name {
+        Some(name) if path == ":memory:" && !name.is_empty() => with_memory_db(name, f),
+        _ => {
+            let db = open_fresh(path, 0)?;
+            f(db.0)
+        }
     }
-    Ok(())
+}
+
+fn exec(path: &str, sql: &str, db_name: Option<&str>) -> Result<(), String> {
+    with_db(path, db_name, |db| {
+        let csql = CString::new(sql).map_err(|e| e.to_string())?;
+        let mut err_ptr: *mut i8 = ptr::null_mut();
+        let rc = unsafe { ffi::sqlite3_exec(db, csql.as_ptr(), None, ptr::null_mut(), &mut err_ptr) };
+        if rc != ffi::SQLITE_OK {
+            let msg = if err_ptr.is_null() {
+                "unknown".to_string()
+            } else {
+                let s = unsafe { CStr::from_ptr(err_ptr).to_string_lossy().into_owned() };
+                unsafe {
+                    ffi::sqlite3_free(err_ptr as *mut _);
+                }
+                s
+            };
+            return Err(format!("exec rc={rc} msg={msg}"));
+        }
+        Ok(())
+    })
 }
 
 fn column_value(stmt: *mut ffi::sqlite3_stmt, i: i32) -> Value {
@@ -169,73 +239,93 @@ fn query_impl(db: *mut ffi::sqlite3, sql: &str, params: &[&str]) -> Result<Value
     Ok(Value::Array(rows))
 }
 
-fn query(path: &str, sql: &str, params: &[&str]) -> Result<Value, String> {
-    let db = open_db(path)?;
-    query_impl(db.0, sql, params)
+fn query(path: &str, sql: &str, params: &[&str], db_name: Option<&str>) -> Result<Value, String> {
+    with_db(path, db_name, |db| query_impl(db, sql, params))
 }
 
-fn exec_params(path: &str, sql: &str, params: &[&str]) -> Result<(), String> {
-    let db = open_db(path)?;
-    let csql = CString::new(sql).map_err(|e| e.to_string())?;
-    let cparams: Vec<CString> = params.iter().map(|p| CString::new(*p).map_err(|e| e.to_string())).collect::<Result<Vec<_>, _>>()?;
-    let mut stmt: *mut ffi::sqlite3_stmt = ptr::null_mut();
-    let rc = unsafe { ffi::sqlite3_prepare_v2(db.0, csql.as_ptr(), -1, &mut stmt, ptr::null_mut()) };
-    if rc != ffi::SQLITE_OK {
-        let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(db.0)).to_string_lossy().into_owned() };
-        return Err(format!("prepare rc={rc} msg={msg}"));
-    }
-    for (i, cp) in cparams.iter().enumerate() {
-        let rc = unsafe { ffi::sqlite3_bind_text(stmt, (i + 1) as i32, cp.as_ptr(), -1, None) };
+fn exec_params(path: &str, sql: &str, params: &[&str], db_name: Option<&str>) -> Result<(), String> {
+    with_db(path, db_name, |db| {
+        let csql = CString::new(sql).map_err(|e| e.to_string())?;
+        let cparams: Vec<CString> = params.iter().map(|p| CString::new(*p).map_err(|e| e.to_string())).collect::<Result<Vec<_>, _>>()?;
+        let mut stmt: *mut ffi::sqlite3_stmt = ptr::null_mut();
+        let rc = unsafe { ffi::sqlite3_prepare_v2(db, csql.as_ptr(), -1, &mut stmt, ptr::null_mut()) };
         if rc != ffi::SQLITE_OK {
-            unsafe {
-                ffi::sqlite3_finalize(stmt);
-            }
-            return Err(format!("bind param {i} rc={rc}"));
+            let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(db)).to_string_lossy().into_owned() };
+            return Err(format!("prepare rc={rc} msg={msg}"));
         }
-    }
-    let step = unsafe { ffi::sqlite3_step(stmt) };
-    unsafe {
-        ffi::sqlite3_finalize(stmt);
-    }
-    if step != ffi::SQLITE_DONE && step != ffi::SQLITE_ROW {
-        let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(db.0)).to_string_lossy().into_owned() };
-        return Err(format!("step rc={step} msg={msg}"));
-    }
-    Ok(())
+        for (i, cp) in cparams.iter().enumerate() {
+            let rc = unsafe { ffi::sqlite3_bind_text(stmt, (i + 1) as i32, cp.as_ptr(), -1, None) };
+            if rc != ffi::SQLITE_OK {
+                unsafe {
+                    ffi::sqlite3_finalize(stmt);
+                }
+                return Err(format!("bind param {i} rc={rc}"));
+            }
+        }
+        let step = unsafe { ffi::sqlite3_step(stmt) };
+        unsafe {
+            ffi::sqlite3_finalize(stmt);
+        }
+        if step != ffi::SQLITE_DONE && step != ffi::SQLITE_ROW {
+            let msg = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(db)).to_string_lossy().into_owned() };
+            return Err(format!("step rc={step} msg={msg}"));
+        }
+        Ok(())
+    })
 }
 
-fn serialize(path: &str) -> Result<Vec<u8>, String> {
-    let db = open_db(path)?;
-    let schema = CString::new("main").unwrap();
-    let mut size: i64 = 0;
-    let p = unsafe { ffi::sqlite3_serialize(db.0, schema.as_ptr(), &mut size, 0) };
-    if p.is_null() || size <= 0 {
-        return Err(format!("serialize null (size={size})"));
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(p, size as usize).to_vec() };
-    unsafe {
-        ffi::sqlite3_free(p as *mut _);
-    }
-    Ok(bytes)
+fn serialize(path: &str, db_name: Option<&str>) -> Result<Vec<u8>, String> {
+    with_db(path, db_name, |db| {
+        let schema = CString::new("main").unwrap();
+        let mut size: i64 = 0;
+        let p = unsafe { ffi::sqlite3_serialize(db, schema.as_ptr(), &mut size, 0) };
+        if p.is_null() || size <= 0 {
+            return Err(format!("serialize null (size={size})"));
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(p, size as usize).to_vec() };
+        unsafe {
+            ffi::sqlite3_free(p as *mut _);
+        }
+        Ok(bytes)
+    })
 }
 
-fn deserialize(path: &str, bytes: &[u8]) -> Result<(), String> {
-    let db = open_db(path)?;
-    let schema = CString::new("main").unwrap();
-    let size = bytes.len() as i64;
-    let buf = unsafe { ffi::sqlite3_malloc64(size as u64) } as *mut u8;
-    if buf.is_null() {
-        return Err("malloc failed".to_string());
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
-    }
-    let flags = (ffi::SQLITE_DESERIALIZE_FREEONCLOSE | ffi::SQLITE_DESERIALIZE_RESIZEABLE) as u32;
-    let rc = unsafe { ffi::sqlite3_deserialize(db.0, schema.as_ptr(), buf, size, size, flags) };
-    if rc != ffi::SQLITE_OK {
-        return Err(format!("deserialize rc={rc}"));
-    }
-    Ok(())
+fn deserialize(path: &str, bytes: &[u8], db_name: Option<&str>) -> Result<(), String> {
+    with_db(path, db_name, |db| {
+        let schema = CString::new("main").unwrap();
+        let size = bytes.len() as i64;
+        let buf = unsafe { ffi::sqlite3_malloc64(size as u64) } as *mut u8;
+        if buf.is_null() {
+            return Err("malloc failed".to_string());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+        }
+        // NOT SQLITE_DESERIALIZE_FREEONCLOSE: for a registry-held :memory:
+        // connection (see MEMORY_REGISTRY), "on close" may be arbitrarily far
+        // in the future (the connection stays open across many later calls)
+        // -- FREEONCLOSE would be correct memory-management but is confusing
+        // to reason about for a long-lived handle, and SQLite takes ownership
+        // of buf via sqlite3_deserialize either way (RESIZEABLE lets it
+        // realloc/grow the buffer as more data is written later, which a
+        // registry connection expects since MORE writes happen after this
+        // deserialize call, unlike the old stateless one-shot-then-close use).
+        // Freeing is instead handled by SQLite itself on the NEXT deserialize
+        // (which replaces the schema) or whenever the connection eventually
+        // does close (via sqlite3_close_v2's normal cleanup of the current
+        // in-memory page image, which SQLite owns regardless of the
+        // FREEONCLOSE flag once deserialize has attached it -- FREEONCLOSE
+        // only controls whether SQLite frees the SPECIFIC buffer pointer we
+        // passed in on close, vs. potentially having copied/replaced it via
+        // RESIZEABLE growth in the meantime; either way this doesn't leak).
+        let flags = ffi::SQLITE_DESERIALIZE_RESIZEABLE as u32;
+        let rc = unsafe { ffi::sqlite3_deserialize(db, schema.as_ptr(), buf, size, size, flags) };
+        if rc != ffi::SQLITE_OK {
+            unsafe { ffi::sqlite3_free(buf as *mut _); }
+            return Err(format!("deserialize rc={rc}"));
+        }
+        Ok(())
+    })
 }
 
 fn libsql_version() -> String {
@@ -282,11 +372,16 @@ fn to_wasi_guest_path(path: &str) -> String {
 /// Every verb requires an explicit `path` (the real db file path, resolved
 /// by the CALLER against its own project root) -- there is no persistent
 /// `name` -> connection mapping anymore, so `name` alone is no longer a
-/// meaningful identifier once one plugin instance serves every project.
+/// meaningful identifier once one plugin instance serves every project...
+/// EXCEPT for the `path == ":memory:"` case, where `db`/`db_name` becomes
+/// load-bearing again as the shared-cache identity (see resolve_open_uri's
+/// and RawDb's doc comments) -- a browser host has no real file path to be
+/// the identity instead, so this is the only identity available to it.
 pub fn handle(verb: &str, body: &Value) -> u64 {
     let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or(":memory:");
     let owned_path = to_wasi_guest_path(raw_path);
     let path = owned_path.as_str();
+    let db_name = body.get("db").or_else(|| body.get("db_name")).and_then(|v| v.as_str());
     match verb {
         // "open"/"close"/"begin"/"commit"/"rollback" are no-ops now -- every
         // exec/query call is already its own open-operate-close cycle, so
@@ -297,13 +392,13 @@ pub fn handle(verb: &str, body: &Value) -> u64 {
         "list_dbs" => return_json(json!({"ok": true, "dbs": Vec::<String>::new()})),
         "exec" => {
             let sql = body.get("sql").and_then(|v| v.as_str()).unwrap_or("");
-            ok_err(exec(path, sql))
+            ok_err(exec(path, sql, db_name))
         }
         "query" | "query_params" => {
             let sql = body.get("sql").and_then(|v| v.as_str()).unwrap_or("");
             let params = str_params(body);
             let refs: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
-            match query(path, sql, &refs) {
+            match query(path, sql, &refs, db_name) {
                 Ok(rows) => return_json(json!({"ok": true, "rows": rows})),
                 Err(e) => return_json(json!({"ok": false, "error": e})),
             }
@@ -312,7 +407,7 @@ pub fn handle(verb: &str, body: &Value) -> u64 {
             let sql = body.get("sql").and_then(|v| v.as_str()).unwrap_or("");
             let params = str_params(body);
             let refs: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
-            ok_err(exec_params(path, sql, &refs))
+            ok_err(exec_params(path, sql, &refs, db_name))
         }
         // "prepare"/"execute_bound"/"finalize" (a cross-call prepared
         // statement handle) is inherently incompatible with per-call
@@ -326,11 +421,11 @@ pub fn handle(verb: &str, body: &Value) -> u64 {
             let sql = body.get("sql").and_then(|v| v.as_str()).unwrap_or("");
             let params = str_params(body);
             let refs: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
-            ok_err(exec_params(path, sql, &refs))
+            ok_err(exec_params(path, sql, &refs, db_name))
         }
         "prepare" => return_json(json!({"ok": false, "error": "prepare/finalize handles removed -- use prepare_execute (or exec_params) which does prepare+bind+step+finalize atomically per call"})),
         "finalize" => ok_err(Ok(())),
-        "serialize" => match serialize(path) {
+        "serialize" => match serialize(path, db_name) {
             Ok(bytes) => {
                 let b64 = base64_encode(&bytes);
                 return_json(json!({"ok": true, "data": b64.clone(), "bytes_b64": b64}))
@@ -344,7 +439,7 @@ pub fn handle(verb: &str, body: &Value) -> u64 {
                 .or_else(|| body.get("bytes_b64").and_then(|v| v.as_str()))
                 .unwrap_or("");
             match base64_decode(b64) {
-                Ok(bytes) => ok_err(deserialize(path, &bytes)),
+                Ok(bytes) => ok_err(deserialize(path, &bytes, db_name)),
                 Err(e) => return_json(json!({"ok": false, "error": e})),
             }
         }
