@@ -5,6 +5,8 @@ use std::ffi::{CStr, CString};
 use std::ptr;
 use std::sync::Mutex;
 
+const BUSY_TIMEOUT_MS: i32 = 30_000;
+
 use crate::abi::{ok_err, return_json};
 
 /// Every verb below opens the db fresh, does its one operation, and closes
@@ -122,8 +124,18 @@ fn open_fresh(path: &str, extra_flags: i32) -> Result<RawDb, String> {
     // again -- so concurrent dispatches genuinely contend, and the symptom was
     // a live `exec rc=5 msg=database is locked` that silently degraded recall's
     // vector half to an empty kv_query fallback. Wait for the lock instead.
+    //
+    // 5000ms proved insufficient in practice: with 51 projects registered
+    // against one shared daemon, a vector-store write on a 119MB gm.db holds
+    // the lock past that window and recall still died with rc=5. WAL is the
+    // real fix -- readers stop blocking on a writer entirely, which is the
+    // whole shape of the contention here (many concurrent readers, occasional
+    // writer) -- and the longer timeout covers the writer-vs-writer case WAL
+    // does not.
     unsafe {
-        ffi::sqlite3_busy_timeout(db, 5000);
+        ffi::sqlite3_busy_timeout(db, BUSY_TIMEOUT_MS);
+        let wal = b"PRAGMA journal_mode=WAL;\0";
+        ffi::sqlite3_exec(db, wal.as_ptr() as *const _, None, std::ptr::null_mut(), std::ptr::null_mut());
     }
     Ok(RawDb(db))
 }
