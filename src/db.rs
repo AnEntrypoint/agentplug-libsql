@@ -1,11 +1,37 @@
 use libsql_ffi as ffi;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 const BUSY_TIMEOUT_MS: i32 = 30_000;
+
+static WAL_CONVERSION_ATTEMPTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// A query that runs unbounded inside this wasm-interpreted build stalls the
+/// whole dispatch with nothing to attribute it to -- the caller only sees a
+/// bodyless failure minutes later. The progress callback fires every
+/// PROGRESS_HANDLER_VM_STEP_INTERVAL VM steps, so a nonzero step count proves
+/// the statement is genuinely executing rather than blocked before the VM
+/// starts, and returning nonzero past the budget aborts it as
+/// SQLITE_INTERRUPT with a real error instead of hanging.
+const PROGRESS_HANDLER_VM_STEP_INTERVAL: i32 = 10_000;
+const PROGRESS_STEP_BUDGET: u64 = 2_000_000;
+static PROGRESS_STEPS: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "C" fn progress_handler(_: *mut std::os::raw::c_void) -> i32 {
+    let steps = PROGRESS_STEPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if steps > PROGRESS_STEP_BUDGET {
+        return 1;
+    }
+    0
+}
+
+pub fn progress_steps_since_open() -> u64 {
+    PROGRESS_STEPS.load(Ordering::Relaxed)
+}
 
 use crate::abi::{ok_err, return_json};
 
@@ -132,10 +158,30 @@ fn open_fresh(path: &str, extra_flags: i32) -> Result<RawDb, String> {
     // whole shape of the contention here (many concurrent readers, occasional
     // writer) -- and the longer timeout covers the writer-vs-writer case WAL
     // does not.
+    //
+    // The WAL conversion needs an EXCLUSIVE lock, so it must not run on every
+    // open: with a connection per call, each open re-attempted it, blocked the
+    // full busy timeout against the other live connections, and never
+    // converted -- turning a millisecond query into a multi-minute stall while
+    // journal_mode stayed `delete`. Attempt it once per process, with the busy
+    // timeout still at its default zero so a contended attempt fails
+    // immediately instead of stalling, and let a later call retry.
     unsafe {
+        let already_attempted = {
+            let mut guard = match WAL_CONVERSION_ATTEMPTED.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let seen = guard.get_or_insert_with(HashSet::new);
+            !seen.insert(path.to_string())
+        };
+        if !already_attempted {
+            let wal = b"PRAGMA journal_mode=WAL;\0";
+            ffi::sqlite3_exec(db, wal.as_ptr() as *const _, None, std::ptr::null_mut(), std::ptr::null_mut());
+        }
         ffi::sqlite3_busy_timeout(db, BUSY_TIMEOUT_MS);
-        let wal = b"PRAGMA journal_mode=WAL;\0";
-        ffi::sqlite3_exec(db, wal.as_ptr() as *const _, None, std::ptr::null_mut(), std::ptr::null_mut());
+        PROGRESS_STEPS.store(0, Ordering::Relaxed);
+        ffi::sqlite3_progress_handler(db, PROGRESS_HANDLER_VM_STEP_INTERVAL, Some(progress_handler), ptr::null_mut());
     }
     Ok(RawDb(db))
 }
@@ -412,7 +458,10 @@ pub fn handle(verb: &str, body: &Value) -> u64 {
             let refs: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
             match query(path, sql, &refs, db_name) {
                 Ok(rows) => return_json(json!({"ok": true, "rows": rows})),
-                Err(e) => return_json(json!({"ok": false, "error": e})),
+                Err(e) => return_json(json!({
+                    "ok": false,
+                    "error": format!("{e} (vm_steps={})", progress_steps_since_open()),
+                })),
             }
         }
         "exec_params" => {
