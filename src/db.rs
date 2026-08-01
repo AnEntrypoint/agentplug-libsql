@@ -10,6 +10,26 @@ const BUSY_TIMEOUT_MS: i32 = 30_000;
 
 static WAL_CONVERSION_ATTEMPTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
+/// `PRAGMA journal_mode=WAL` returns SQLITE_OK while leaving the mode
+/// unchanged when it cannot take the exclusive lock, so the return code alone
+/// does not tell you it worked. Read the mode back.
+unsafe fn journal_mode_is_wal(db: *mut ffi::sqlite3) -> bool {
+    let sql = b"PRAGMA journal_mode;\0";
+    let mut stmt: *mut ffi::sqlite3_stmt = ptr::null_mut();
+    if ffi::sqlite3_prepare_v2(db, sql.as_ptr() as *const _, -1, &mut stmt, ptr::null_mut()) != ffi::SQLITE_OK {
+        return false;
+    }
+    let mut is_wal = false;
+    if ffi::sqlite3_step(stmt) == ffi::SQLITE_ROW {
+        let p = ffi::sqlite3_column_text(stmt, 0);
+        if !p.is_null() {
+            is_wal = CStr::from_ptr(p as *const _).to_string_lossy().eq_ignore_ascii_case("wal");
+        }
+    }
+    ffi::sqlite3_finalize(stmt);
+    is_wal
+}
+
 /// A query that runs unbounded inside this wasm-interpreted build stalls the
 /// whole dispatch with nothing to attribute it to -- the caller only sees a
 /// bodyless failure minutes later. The progress callback fires every
@@ -205,17 +225,39 @@ fn open_fresh(path: &str, extra_flags: i32) -> Result<RawDb, String> {
     // timeout still at its default zero so a contended attempt fails
     // immediately instead of stalling, and let a later call retry.
     unsafe {
-        let already_attempted = {
-            let mut guard = match WAL_CONVERSION_ATTEMPTED.lock() {
+        // Memoize on SUCCESS, not on attempt. Marking the path as done after a
+        // failed conversion meant one contended attempt disabled it forever for
+        // the process, which is why this store still read journal_mode=delete
+        // after the conversion had "run".
+        //
+        // WAL is what makes the path connection cache safe to hold open: under
+        // delete-mode journaling a held connection keeps SQLite's lock and every
+        // other process gets `database is locked` on every query (measured:
+        // three different statements, all rc=5 with vm_steps=0). Under WAL a
+        // concurrent reader goes straight through (measured on a copy of this
+        // same store: a reader returned its rows while another connection was
+        // open). The cache and this conversion were fighting each other.
+        let already_converted = {
+            let guard = match WAL_CONVERSION_ATTEMPTED.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            let seen = guard.get_or_insert_with(HashSet::new);
-            !seen.insert(path.to_string())
+            guard.as_ref().is_some_and(|seen| seen.contains(path))
         };
-        if !already_attempted {
+        if !already_converted {
             let wal = b"PRAGMA journal_mode=WAL;\0";
-            ffi::sqlite3_exec(db, wal.as_ptr() as *const _, None, std::ptr::null_mut(), std::ptr::null_mut());
+            let mut mode: *mut i8 = ptr::null_mut();
+            let rc = ffi::sqlite3_exec(db, wal.as_ptr() as *const _, None, ptr::null_mut(), &mut mode);
+            if !mode.is_null() {
+                ffi::sqlite3_free(mode as *mut _);
+            }
+            if rc == ffi::SQLITE_OK && journal_mode_is_wal(db) {
+                let mut guard = match WAL_CONVERSION_ATTEMPTED.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.get_or_insert_with(HashSet::new).insert(path.to_string());
+            }
         }
         ffi::sqlite3_busy_timeout(db, BUSY_TIMEOUT_MS);
         PROGRESS_STEPS.store(0, Ordering::Relaxed);
