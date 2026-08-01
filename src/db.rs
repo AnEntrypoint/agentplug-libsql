@@ -230,6 +230,13 @@ fn open_fresh(path: &str, extra_flags: i32) -> Result<RawDb, String> {
 /// operation below routes through, so the registry-vs-fresh choice lives in
 /// exactly one place.
 fn with_db<T>(path: &str, db_name: Option<&str>, f: impl FnOnce(*mut ffi::sqlite3) -> Result<T, String>) -> Result<T, String> {
+    // PRECEDENCE, stated because callers disagree about it: `db_name` is
+    // consulted ONLY when the path is `:memory:`. For any real file path the
+    // handle name is ignored entirely and routing is by resolved path alone,
+    // so two projects both passing db="gm" against different files get
+    // different connections and cannot collide. Callers that send a `db`
+    // alongside a real path (rs-plugkit's shared_db does; its libsql_wasm
+    // does not) are therefore both correct -- the field is simply inert there.
     match db_name {
         Some(name) if path == ":memory:" && !name.is_empty() => with_memory_db(name, f),
         _ if path == ":memory:" => {
