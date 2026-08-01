@@ -112,6 +112,44 @@ impl Drop for RawDb {
 ///    isolation beyond honoring whatever name it's given.
 static MEMORY_REGISTRY: Mutex<Option<HashMap<String, RawDb>>> = Mutex::new(None);
 
+/// File-path connections, keyed by resolved path.
+///
+/// The stateless-per-call design above is right about isolation but wrong
+/// about cost once a store gets large: opening a 119MB database through this
+/// wasm build is orders of magnitude slower than the statement it then runs.
+/// Measured against a real gm.db, two trivial statements (a CREATE TABLE IF
+/// NOT EXISTS and a single-row SELECT) that take 0.23s via the sqlite3 CLI
+/// cost ~65 SECONDS through this plugin, because every exec/query paid its own
+/// cold open. That is a user-visible stall on every recall.
+///
+/// Reuse is safe here for the same reason the `:memory:` registry is: every
+/// statement in this module is finalized before its call returns (there are
+/// more sqlite3_finalize sites than sqlite3_prepare_v2 sites, because the
+/// error paths finalize too), so a cached connection never holds a pending
+/// statement. That is exactly the condition RawDb's Drop warns about -- an
+/// orphaned connection with live statements keeps SQLite's internal lock and
+/// produces phantom `database is locked` errors -- and it is the reason this
+/// cache stores the connection rather than leaking one per call.
+///
+/// Isolation is preserved by keying on the resolved path: two projects with
+/// different db files get different entries, and the same file genuinely IS
+/// the same database, which is what SQLite's own locking already assumes.
+static PATH_REGISTRY: Mutex<Option<HashMap<String, RawDb>>> = Mutex::new(None);
+
+fn with_path_db<T>(path: &str, f: impl FnOnce(*mut ffi::sqlite3) -> Result<T, String>) -> Result<T, String> {
+    let mut guard = match PATH_REGISTRY.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let map = guard.get_or_insert_with(HashMap::new);
+    if !map.contains_key(path) {
+        let db = open_fresh(path, 0)?;
+        map.insert(path.to_string(), db);
+    }
+    let handle = map.get(path).map(|d| d.0).ok_or_else(|| "path registry entry vanished".to_string())?;
+    f(handle)
+}
+
 fn with_memory_db<T>(name: &str, f: impl FnOnce(*mut ffi::sqlite3) -> Result<T, String>) -> Result<T, String> {
     let mut guard = MEMORY_REGISTRY.lock().map_err(|e| format!("memory registry poisoned: {e}"))?;
     let map = guard.get_or_insert_with(HashMap::new);
@@ -194,10 +232,11 @@ fn open_fresh(path: &str, extra_flags: i32) -> Result<RawDb, String> {
 fn with_db<T>(path: &str, db_name: Option<&str>, f: impl FnOnce(*mut ffi::sqlite3) -> Result<T, String>) -> Result<T, String> {
     match db_name {
         Some(name) if path == ":memory:" && !name.is_empty() => with_memory_db(name, f),
-        _ => {
+        _ if path == ":memory:" => {
             let db = open_fresh(path, 0)?;
             f(db.0)
         }
+        _ => with_path_db(path, f),
     }
 }
 
