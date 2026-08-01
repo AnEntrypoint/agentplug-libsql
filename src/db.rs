@@ -6,7 +6,14 @@ use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-const BUSY_TIMEOUT_MS: i32 = 30_000;
+// Must stay WELL under the host dispatch deadline (DISPATCH_CALL_DEADLINE_SECS
+// = 40s). At 30s a fully-consumed wait plus the surrounding statements
+// exceeded the epoch budget and the instance TRAPPED instead of returning a
+// SQLITE_BUSY the caller could report -- a trap carries no error text, so a
+// contended write looked like a crash rather than contention. 8s leaves room
+// for the rest of the call and still absorbs the ordinary contention this
+// timeout exists for.
+const BUSY_TIMEOUT_MS: i32 = 8_000;
 
 static WAL_CONVERSION_ATTEMPTED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
