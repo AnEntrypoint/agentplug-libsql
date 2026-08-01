@@ -487,6 +487,26 @@ pub fn handle(verb: &str, body: &Value) -> u64 {
         // existing callers that still send them don't need updating first.
         "open" | "close" | "begin" | "commit" | "rollback" => ok_err(Ok(())),
         "list_dbs" => return_json(json!({"ok": true, "dbs": Vec::<String>::new()})),
+        // Answers "what can you do" without side effects, so a caller can
+        // probe before dispatching instead of discovering a missing verb as
+        // an indistinguishable ok:false. `inert_verbs` is the load-bearing
+        // part: those are accepted and do nothing, which a caller cannot
+        // otherwise tell from a working transaction.
+        "capabilities" => return_json(json!({
+            "ok": true,
+            "plugin": "libsql",
+            "verbs": [
+                "open", "close", "exec", "exec_params", "query", "query_params",
+                "prepare_execute", "execute_bound", "begin", "commit", "rollback",
+                "serialize", "deserialize", "list_dbs", "version", "capabilities",
+            ],
+            "inert_verbs": ["open", "close", "begin", "commit", "rollback"],
+            "payload_field": {
+                "query": "rows", "query_params": "rows",
+                "serialize": "bytes_b64", "list_dbs": "dbs",
+            },
+            "stateless_per_call": true,
+        })),
         "exec" => {
             let sql = body.get("sql").and_then(|v| v.as_str()).unwrap_or("");
             ok_err(exec(path, sql, db_name))
