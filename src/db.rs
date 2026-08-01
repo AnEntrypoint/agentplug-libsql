@@ -237,6 +237,13 @@ fn open_fresh(path: &str, extra_flags: i32) -> Result<RawDb, String> {
         // concurrent reader goes straight through (measured on a copy of this
         // same store: a reader returned its rows while another connection was
         // open). The cache and this conversion were fighting each other.
+        // Set the busy timeout FIRST. It was applied AFTER the conversion, so
+        // PRAGMA journal_mode=WAL -- which needs an exclusive lock -- ran with
+        // a ZERO timeout and gave up instantly on any contention, leaving the
+        // fresh connection reporting SQLITE_BUSY on its first write. Measured
+        // at the failure: opens=1 live_conns=1, i.e. no other connection
+        // existed in the process, so the instant give-up was the whole cause.
+        ffi::sqlite3_busy_timeout(db, BUSY_TIMEOUT_MS);
         let already_converted = {
             let guard = match WAL_CONVERSION_ATTEMPTED.lock() {
                 Ok(g) => g,
@@ -259,7 +266,6 @@ fn open_fresh(path: &str, extra_flags: i32) -> Result<RawDb, String> {
                 guard.get_or_insert_with(HashSet::new).insert(path.to_string());
             }
         }
-        ffi::sqlite3_busy_timeout(db, BUSY_TIMEOUT_MS);
         PROGRESS_STEPS.store(0, Ordering::Relaxed);
         ffi::sqlite3_progress_handler(db, PROGRESS_HANDLER_VM_STEP_INTERVAL, Some(progress_handler), ptr::null_mut());
     }
@@ -304,7 +310,8 @@ fn exec(path: &str, sql: &str, db_name: Option<&str>) -> Result<(), String> {
                 }
                 s
             };
-            return Err(format!("exec rc={rc} msg={msg}"));
+            let ext = unsafe { ffi::sqlite3_extended_errcode(db) };
+            return Err(format!("exec rc={rc} ext={ext} msg={msg}"));
         }
         Ok(())
     })
