@@ -318,6 +318,14 @@ fn exec(path: &str, sql: &str, db_name: Option<&str>) -> Result<(), String> {
                 s
             };
             let ext = unsafe { ffi::sqlite3_extended_errcode(db) };
+            // A bare  sends the reader hunting for a live
+            // process. Under this VFS the usual cause is a STALE dot-lock
+            // directory left by an unclean exit, which no process holds and no
+            // timeout expires. Name it so the fix is obvious.
+            if rc == ffi::SQLITE_BUSY {
+                let lock_dir = format!("{path}.lock");
+                return Err(format!("exec rc={rc} ext={ext} msg={msg} -- if no process holds this db, check for a stale dot-lock directory at {lock_dir} and remove it"));
+            }
             return Err(format!("exec rc={rc} ext={ext} msg={msg}"));
         }
         Ok(())
