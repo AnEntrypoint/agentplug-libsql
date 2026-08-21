@@ -29,7 +29,5 @@ jobs:
         export CC_wasm32_wasip1="$WASI_SDK_PATH/bin/clang"
         export CFLAGS_wasm32_wasip1="--sysroot=$WASI_SDK_PATH/share/wasi-sysroot -DLONGDOUBLE_TYPE=double -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_DEFAULT_MMAP_SIZE=0 -DSQLITE_THREADSAFE=0 -DSQLITE_TEMP_STORE=3 -DHAVE_FDATASYNC=0 -DHAVE_POSIX_FALLOCATE=0 -DHAVE_PREAD=0 -DHAVE_PWRITE=0 -DPROT_READ=1 -DPROT_WRITE=2 -DMAP_SHARED=1 -DMAP_FAILED=((void*)-1) -DMAP_PRIVATE=2 -Wno-error=implicit-function-declaration -Wno-error=int-conversion"
       build_command: cargo build --release --target wasm32-wasip1
-      npm_package_name: agentplug-libsql-wasm
     secrets:
       publisher_token: ${{ secrets.PUBLISHER_TOKEN }}
-      npm_token: ${{ secrets.NPM_TOKEN }}
