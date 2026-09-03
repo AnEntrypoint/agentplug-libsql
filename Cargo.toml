@@ -1,0 +1,30 @@
+[package]
+name = "agentplug-libsql"
+version = "0.1.12"
+edition = "2021"
+
+[lib]
+name = "agentplug_libsql"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "z"
+
+[dependencies]
+# preserve_order: query_impl builds each row as a serde_json::Map -- without
+# this feature that Map is a BTreeMap and silently reorders every row's
+# fields alphabetically by column name, which the JS client (rows array
+# built by iterating Object.keys(row) in insertion order) then reports as
+# its own `columns` array -- a caller indexing `rows[i][0]` after a SELECT
+# with more than one column gets whichever column happens to sort first,
+# not the one actually first in the query. Live-verified: SELECT key_alias,
+# vector_distance_cos(...) AS distance returned columns ["distance",
+# "key_alias"], the opposite of the SQL's own SELECT order.
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+libsql-ffi = { version = "=0.9.30", default-features = false, features = ["wasm32-wasi-vfs"] }
