@@ -1,0 +1,4 @@
+target/
+Cargo.lock
+config.bat
+node_modules
