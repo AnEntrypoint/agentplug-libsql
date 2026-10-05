@@ -61,32 +61,12 @@ pub extern "C" fn plugin_call(verb_ptr: u32, verb_len: u32, body_ptr: u32, body_
     attach_diagnostics(packed)
 }
 
-// Merges any diagnostics db.rs collected during this call (e.g. the WAL-
-// unavailable notice, which cannot use eprintln! -- see PENDING_DIAGNOSTICS'
-// own doc comment for why) into the response's own JSON body as a
-// "diagnostics" array, so the JS host can dedupe/print them itself instead
-// of writing raw wasm-side stdio the host cannot intercept. A no-op
-// (returns `packed` unchanged) whenever nothing was pushed this call, and
-// best-effort: a response this function cannot parse as JSON (should not
-// happen -- every db.rs verb arm returns return_json()'s own output) is
-// passed through unchanged rather than dropped.
 fn attach_diagnostics(packed: u64) -> u64 {
-    // Drained UNCONDITIONALLY, before any other check -- PENDING_DIAGNOSTICS
-    // is a thread_local Vec that outlives a single plugin_call, so leaving it
-    // undrained on any path would not discard a diagnostic, it would silently
-    // carry it forward and attach it to a LATER, unrelated call's response.
     let diagnostics = crate::db::take_pending_diagnostics();
     if diagnostics.is_empty() {
         return packed;
     }
     let diagnostics_value = serde_json::Value::Array(diagnostics.into_iter().map(serde_json::Value::String).collect());
-    // packed == 0 means db::handle() returned an EMPTY response (return_bytes'
-    // own contract for an empty Vec) -- no existing verb arm does this today,
-    // but nothing guarantees a future one won't. Falling through to `return
-    // packed` here (as an earlier version did) would drop already-drained
-    // diagnostics on the floor instead of just skipping the merge -- they are
-    // real, correctly-triggered warnings, not a caller-visible response body.
-    // Synthesize a minimal JSON object to carry them instead of discarding.
     if packed == 0 {
         return return_json(serde_json::json!({ "diagnostics": diagnostics_value }));
     }
