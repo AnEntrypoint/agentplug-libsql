@@ -2,3 +2,5 @@ target/
 Cargo.lock
 node_modules
 .gm/config-source-cache-default/
+.gm/exec-spool/
+.gm/config-source-cache-default.*.sync.json
